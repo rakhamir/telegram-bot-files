@@ -5,6 +5,7 @@ import uuid
 import threading
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler
 
 # --- CONFIGURATION ---
@@ -15,14 +16,18 @@ DB_FILE = "files_db.json"
 # --- FLASK KEEP-ALIVE SERVER ---
 app = Flask(__name__)
 
+# Reduce Flask logging to keep console clean
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+
 @app.route('/')
 def home():
-    return "Bot is running!"
+    return "Alive", 200
 
 def run_web_server():
-    # Render provides the PORT variable
     port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
+    # use_reloader=False prevents double execution
+    app.run(host='0.0.0.0', port=port, use_reloader=False)
 
 # --- BOT LOGIC ---
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -42,12 +47,16 @@ def save_file_entry(name, file_id):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     files = load_files()
+    
+    # Check if files exist
     if not files:
-        await update.message.reply_text("No files yet.")
+        await update.message.reply_text("System restarted. Database might be empty (See admin).")
         return
+
     keyboard = []
     for short_id, file_data in files.items():
         keyboard.append([InlineKeyboardButton(file_data['name'], callback_data=short_id)])
+    
     await update.message.reply_text("👋 Choose a file:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -58,7 +67,16 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
 
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    
+    # --- FIX 1: Handle "Query is too old" ---
+    try:
+        await query.answer()
+    except BadRequest:
+        # If the button click is too old, we just ignore the error and proceed
+        pass
+    except Exception as e:
+        logging.error(f"Error answering query: {e}")
+
     files = load_files()
     chat_id = update.effective_chat.id
     
@@ -73,19 +91,21 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             msg = await query.message.reply_document(document=files[short_id]['file_id'], caption=f"📄 {files[short_id]['name']}")
             context.user_data['last_file_msg_id'] = msg.message_id
-        except Exception: await query.message.reply_text("❌ Error sending file.")
+        except Exception: 
+            await query.message.reply_text("❌ Error sending file.")
     else:
-        await query.message.reply_text("❌ File not found.")
+        # This usually happens if Render restarted and wiped the JSON
+        await query.message.reply_text("❌ File not found (Database reset).")
 
 if __name__ == '__main__':
-    # 1. Start the dummy web server in a separate thread
-    threading.Thread(target=run_web_server).start()
+    # Start web server
+    threading.Thread(target=run_web_server, daemon=True).start()
     
-    # 2. Start the Bot
+    # Start Bot
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler('start', start))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document_upload))
     application.add_handler(CallbackQueryHandler(button_click))
     
-    print("Bot is running on Render...")
+    print("Bot is running on Render (Crash-Proof Version)...")
     application.run_polling()
